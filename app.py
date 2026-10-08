@@ -2,10 +2,12 @@ import streamlit as st
 from PIL import Image, ImageOps
 from rembg import new_session, remove
 import io
+import zipfile
 from pathlib import Path
 
-st.set_page_config(page_title="Player Image Cutter", page_icon="⚽")
-st.title("⚽ Player Image Dicut & Auto-Resize")
+st.set_page_config(page_title="Player Image Cutter (Batch)", page_icon="⚽")
+st.title("⚽ Player Image Dicut & Batch Resize")
+st.write("อัปโหลดรูปนักเตะพร้อมกันหลายคน เลือกลีก และดาวน์โหลดไฟล์ผลลัพธ์ทั้งหมดเป็น ZIP")
 
 CONFIG = {
     "T1": {
@@ -18,7 +20,6 @@ CONFIG = {
     }
 }
 
-# ใช้โมเดล u2net เพื่อความเสถียรและไม่กินแรมจนเครื่องค้าง
 @st.cache_resource
 def load_session():
     return new_session("u2net")
@@ -26,25 +27,21 @@ def load_session():
 session = load_session()
 
 def process_player(image: Image.Image, target_w: int, target_h: int, mode: str):
-    # ปรับแนวภาพตามกล้อง
     image = ImageOps.exif_transpose(image)
     
-    # ป้องกันแรมเต็ม: ลดขนาดภาพต้นฉบับถ้าใหญ่เกิน 2000px
+    # ป้องกันแรมเต็ม
     max_dim = 2000
     if max(image.size) > max_dim:
         image.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
         
-    # ตัดพื้นหลัง
     cutout = remove(image.convert("RGBA"), session=session)
     
-    # ลบขอบโปร่งใสส่วนเกิน
     bbox = cutout.getbbox()
     if bbox:
         cutout = cutout.crop(bbox)
         
     src_w, src_h = cutout.size
     
-    # กรณีภาพขนาดเล็ก ให้ตัดเน้นเฉพาะ 60% ตัวบน (หน้า/อก)
     if mode == "upper":
         cutout = cutout.crop((0, 0, src_w, int(src_h * 0.60)))
         src_w, src_h = cutout.size
@@ -58,32 +55,60 @@ def process_player(image: Image.Image, target_w: int, target_h: int, mode: str):
     canvas.paste(resized_img, ((target_w - new_w) // 2, target_h - new_h), resized_img)
     return canvas
 
+# แผงตั้งค่า
 col1, col2 = st.columns(2)
 with col1:
     tier = st.selectbox("เลือกลีก", ["T1", "T2"])
 with col2:
     preset = st.selectbox("ประเภทกราฟิก", list(CONFIG[tier].keys()))
 
-uploaded = st.file_uploader("เลือกรูปภาพนักเตะ", type=["jpg", "jpeg", "png"])
+# เปิดให้อัปโหลดพร้อมกันได้หลายไฟล์ (accept_multiple_files=True)
+uploaded_files = st.file_uploader(
+    "เลือกรูปภาพนักเตะ (เลือกพร้อมกันหลายไฟล์ได้)", 
+    type=["jpg", "jpeg", "png"],
+    accept_multiple_files=True
+)
 
-if uploaded:
-    img = Image.open(uploaded)
-    st.image(img, width=250, caption="รูปต้นฉบับ")
+if uploaded_files:
+    st.info(f"เลือกไว้ทั้งหมด {len(uploaded_files)} ไฟล์")
     
-    if st.button("เริ่มประมวลผล", type="primary"):
+    if st.button("🚀 เริ่มประมวลผลทั้งหมด", type="primary"):
         w, h = CONFIG[tier][preset]["size"]
         m = CONFIG[tier][preset]["mode"]
+        clean_preset_name = preset.split(" ")[0].lower()
         
-        with st.spinner("กำลังตัดขอบและจัดขนาด..."):
-            res = process_player(img, w, h, m)
-            
-        st.image(res, caption=f"ผลลัพธ์ ({w}x{h} px)")
+        # Buffer สำหรับสร้างไฟล์ ZIP ในหน่วยความจำ
+        zip_buffer = io.BytesIO()
         
-        buf = io.BytesIO()
-        res.save(buf, format="PNG")
+        # แถบแสดงความคืบหน้า (Progress Bar)
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for idx, uploaded_file in enumerate(uploaded_files):
+                status_text.text(f"กำลังประมวลผล [{idx + 1}/{len(uploaded_files)}]: {uploaded_file.name}")
+                
+                img = Image.open(uploaded_file)
+                result_img = process_player(img, w, h, m)
+                
+                # แปลงเป็น PNG และเก็บลงใน ZIP
+                img_byte_arr = io.BytesIO()
+                result_img.save(img_byte_arr, format="PNG")
+                
+                file_stem = Path(uploaded_file.name).stem
+                out_name = f"{file_stem}_{tier}_{clean_preset_name}_{w}x{h}.png"
+                zip_file.writestr(out_name, img_byte_arr.getvalue())
+                
+                # อัปเดตสถานะ Progress Bar
+                progress_bar.progress((idx + 1) / len(uploaded_files))
+                
+        status_text.text("✅ ประมวลผลเสร็จสิ้นทุกไฟล์แล้ว!")
+        st.success(f"แปลงรูปภาพสำเร็จครบทั้ง {len(uploaded_files)} รูป")
+        
+        # ปุ่มดาวน์โหลดไฟล์ ZIP รวม
         st.download_button(
-            label="💾 ดาวน์โหลด PNG",
-            data=buf.getvalue(),
-            file_name=f"{Path(uploaded.name).stem}_{tier}_{w}x{h}.png",
-            mime="image/png"
+            label="📦 ดาวน์โหลดรูปทั้งหมด (.ZIP)",
+            data=zip_buffer.getvalue(),
+            file_name=f"players_{tier}_{clean_preset_name}_{w}x{h}.zip",
+            mime="application/zip"
         )
